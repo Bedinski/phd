@@ -132,3 +132,18 @@ def test_may_skip_respects_from_stage_boundary() -> None:
 def test_stage_idx_rejects_unknown() -> None:
     with pytest.raises(ValueError):
         orch._stage_idx("nonexistent")
+
+
+# --- required artifacts -----------------------------------------------------
+
+
+def test_required_artifact_paths_single_file() -> None:
+    paths = orch._required_artifact_paths("research", "r1", None)
+    assert len(paths) == 1
+    assert paths[0].name == "findings.json"
+
+
+def test_required_artifact_paths_dual_file() -> None:
+    paths = orch._required_artifact_paths("review", "r1", None)
+    names = sorted(p.name for p in paths)
+    assert names == ["critique.json", "decision.json"]

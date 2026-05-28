@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from claude_agent_sdk import (
@@ -83,6 +84,9 @@ class StageInvocation:
     setting_sources: list[str] | None = None
     soft_ceiling_pct: float = 50.0
     hard_ceiling_pct: float = 65.0
+    # Required artifacts whose existence on disk is the stage's success condition.
+    # The Stop hook will refuse to let the turn end until they exist.
+    required_artifacts: tuple[Path, ...] = ()
 
 
 @dataclass
@@ -201,6 +205,35 @@ async def run_stage(inv: StageInvocation) -> StageRunResult:
             }
         return {}
 
+    async def stop_hook(inp: dict, tool_use_id: str | None, ctx: HookContext) -> dict:
+        # Safety net: many models will narrate findings instead of writing the
+        # artifact (observed live with Haiku 4.5). Refuse the stop until the
+        # required files exist on disk. `stop_hook_active` guards against
+        # infinite blocks: if we've already blocked once, let the agent finish.
+        if inp.get("stop_hook_active"):
+            return {}
+        missing = [p for p in inv.required_artifacts if not p.exists()]
+        if not missing:
+            return {}
+        missing_list = "\n".join(f"  - {p}" for p in missing)
+        log.warning(
+            "stage %s: Stop hook blocked — required artifacts missing: %s",
+            inv.stage_name,
+            [str(p) for p in missing],
+        )
+        return {
+            "decision": "block",
+            "reason": (
+                "REQUIRED ARTIFACT MISSING. You cannot end your turn until "
+                "every required output file exists on disk. Use the Write tool "
+                "to create each of these paths with content that validates "
+                "against the schema in your system prompt. Do not narrate; "
+                "WRITE THE FILE(S):\n"
+                f"{missing_list}\n"
+                "After writing, re-confirm each path exists, then end your turn."
+            ),
+        }
+
     options = ClaudeAgentOptions(
         allowed_tools=inv.allowed_tools,
         mcp_servers=inv.mcp_servers,
@@ -214,6 +247,7 @@ async def run_stage(inv: StageInvocation) -> StageRunResult:
         hooks={
             "PreToolUse": [HookMatcher(matcher=None, hooks=[pre_tool_hook])],
             "PostToolUse": [HookMatcher(matcher=None, hooks=[post_tool_hook])],
+            "Stop": [HookMatcher(matcher=None, hooks=[stop_hook])],
         },
     )
 

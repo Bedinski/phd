@@ -203,6 +203,8 @@ async def _run_one(
     handoff = _prior_artifacts_block(stage_name, run_id, inp.runs_root)
     user_prompt = base_user_prompt + handoff
 
+    required = _required_artifact_paths(stage_name, run_id, inp.runs_root)
+
     respawns = 0
     result: StageRunResult | None = None
     while True:
@@ -218,6 +220,7 @@ async def _run_one(
             cwd=str(inp.cwd),
             soft_ceiling_pct=inp.soft_ceiling_pct,
             hard_ceiling_pct=inp.hard_ceiling_pct,
+            required_artifacts=required,
         )
         result = await run_stage(inv)
         if result.exit_reason == "error":
@@ -325,6 +328,15 @@ def _integrity_ok(
 # ---------------------------------------------------------------------------
 # Output loading
 # ---------------------------------------------------------------------------
+
+
+def _required_artifact_paths(stage_name: str, run_id: str, root: Path | None) -> tuple[Path, ...]:
+    """Paths the Stop hook will hard-require before letting the agent end its turn."""
+    stage = STAGES[stage_name]
+    filenames = (
+        (stage.output_filename,) if isinstance(stage.output_filename, str) else stage.output_filename
+    )
+    return tuple(stage_dir(run_id, stage_name, root=root) / fn for fn in filenames)
 
 
 def _try_load_outputs(
