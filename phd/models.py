@@ -252,6 +252,16 @@ class FinalReport(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class StageStat(BaseModel):
+    """Per-stage execution record, used for observability and resume."""
+
+    peak_context_pct: float
+    output_tokens: int
+    respawns: int = 0
+    ceiling_hit: bool = False
+    completed_at: datetime
+
+
 class RunManifest(BaseModel):
     """Top-level metadata for a pipeline run, written first to runs/<run_id>/."""
 
@@ -263,4 +273,8 @@ class RunManifest(BaseModel):
     stage_models: dict[str, str]
     stage_effort: dict[str, str]
     completed_stages: list[str] = Field(default_factory=list)
+    stage_stats: dict[str, StageStat] = Field(default_factory=dict)
+    revision_rounds: int = 0
     last_decision: Decision | None = None
+    halted_at: str | None = None
+    halt_reason: str | None = None

@@ -14,7 +14,7 @@ from rich.table import Table
 
 from .orchestrator import PipelineInput, run_pipeline
 from .persistence import STAGE_DIRS, run_dir
-from .stages._models import ModelConfig
+from .stages import ModelConfig
 
 app = typer.Typer(no_args_is_help=True, add_completion=False, pretty_exceptions_enable=False)
 console = Console()
@@ -66,7 +66,12 @@ def research(
     model_backtest: Optional[str] = typer.Option(None),
     model_risk: Optional[str] = typer.Option(None),
     model_report: Optional[str] = typer.Option(None),
-    ceiling_pct: float = typer.Option(50.0, help="Context-window ceiling per stage (%%)"),
+    soft_ceiling_pct: float = typer.Option(
+        50.0, help="Soft context ceiling: nudge the agent to wrap up at this %%"
+    ),
+    hard_ceiling_pct: float = typer.Option(
+        65.0, help="Hard context ceiling: deny further context-growing tools at this %%"
+    ),
     max_review_rounds: int = typer.Option(3),
     verbose: bool = typer.Option(False, "-v", "--verbose"),
 ):
@@ -94,7 +99,55 @@ def research(
         model_config=model_cfg,
         cwd=Path.cwd(),
         max_review_rounds=max_review_rounds,
-        ceiling_pct=ceiling_pct,
+        soft_ceiling_pct=soft_ceiling_pct,
+        hard_ceiling_pct=hard_ceiling_pct,
+    )
+    summary = asyncio.run(run_pipeline(inp))
+    console.print_json(json.dumps(summary, default=str))
+
+
+@app.command()
+def resume(
+    run_id: str = typer.Argument(..., help="Run id to resume"),
+    from_stage: Optional[str] = typer.Option(
+        None, "--from-stage",
+        help="Force re-run from this stage onward (research|review|"
+        "strategy_synthesis|backtest|risk_check|report). Earlier stages with a "
+        "valid artifact are reused.",
+    ),
+    soft_ceiling_pct: float = typer.Option(50.0),
+    hard_ceiling_pct: float = typer.Option(65.0),
+    max_review_rounds: int = typer.Option(3),
+    verbose: bool = typer.Option(False, "-v", "--verbose"),
+):
+    """Resume a run: reuse valid artifacts, re-run what's missing or forced."""
+    _bootstrap_logging(verbose)
+    manifest_path = run_dir(run_id) / "manifest.json"
+    if not manifest_path.exists():
+        console.print(f"[red]no manifest for run:[/red] {run_id}")
+        raise typer.Exit(1)
+
+    manifest = json.loads(manifest_path.read_text())
+    # Reconstruct the model config from the manifest so resumed stages keep the
+    # same models/effort the run was started with.
+    cfg = ModelConfig()
+    for stage_name, model in manifest.get("stage_models", {}).items():
+        cfg.override_stage(stage_name, model=model)
+    for stage_name, eff in manifest.get("stage_effort", {}).items():
+        cfg.override_stage(stage_name, effort=None if eff == "none" else eff)
+
+    inp = PipelineInput(
+        thesis=manifest["thesis"],
+        universe=manifest["universe"],
+        strategy_type=manifest["strategy_type"],
+        research_questions=[],
+        model_config=cfg,
+        cwd=Path.cwd(),
+        max_review_rounds=max_review_rounds,
+        soft_ceiling_pct=soft_ceiling_pct,
+        hard_ceiling_pct=hard_ceiling_pct,
+        resume_run_id=run_id,
+        from_stage=from_stage,
     )
     summary = asyncio.run(run_pipeline(inp))
     console.print_json(json.dumps(summary, default=str))

@@ -16,7 +16,6 @@ from phd.persistence import (
     ensure_run_layout,
     mint_run_id,
     read_artifact,
-    run_dir,
     stage_dir,
     write_artifact,
 )

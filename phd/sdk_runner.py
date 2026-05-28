@@ -1,27 +1,36 @@
-"""ClaudeSDKClient wrapper: per-stage session, usage monitoring, checkpoint loop.
+"""ClaudeSDKClient wrapper: per-stage session, live context-ceiling enforcement.
 
 The orchestrator never talks to `claude_agent_sdk` directly; it calls
-`run_stage(...)` here. That keeps the structural rules (fresh session per
-stage, 50%-ceiling enforcement, transcript-on-disk-only) in one place.
+`run_stage(...)` here. This module owns the structural rules:
+
+  * fresh session per stage (context isolation)
+  * a *proactive* context ceiling enforced mid-turn via hooks + the SDK's real
+    `get_context_usage()` (not an end-of-turn token estimate)
+  * a tool firewall: each stage may only call its allowlisted tools, and no
+    stage may Read another stage's raw transcript (anti-dilution)
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
-import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
-    ContextUsageResponse,
+    HookContext,
+    HookMatcher,
     Message,
+    PermissionResultAllow,
+    PermissionResultDeny,
     ResultMessage,
     SystemMessage,
     TextBlock,
     ThinkingBlock,
+    ToolPermissionContext,
     ToolResultBlock,
     ToolUseBlock,
     UserMessage,
@@ -30,6 +39,27 @@ from claude_agent_sdk import (
 from .persistence import append_transcript
 
 log = logging.getLogger(__name__)
+
+
+# Tools whose results grow the context window. When the hard ceiling is hit we
+# deny these so the model cannot keep inflating context; Write is always allowed
+# so it can still persist a checkpoint or the final artifact.
+CONTEXT_GROWING_TOOLS = frozenset(
+    {
+        "WebSearch",
+        "WebFetch",
+        "Read",
+        "Grep",
+        "Glob",
+        "mcp__phd__fetch_ohlcv",
+        "mcp__phd__run_backtest",
+        "mcp__phd__walk_forward",
+        "mcp__phd__param_sensitivity",
+        "mcp__phd__monte_carlo",
+    }
+)
+
+ALWAYS_ALLOWED_TOOLS = frozenset({"Write", "Edit", "TodoWrite"})
 
 
 # ---------------------------------------------------------------------------
@@ -49,9 +79,10 @@ class StageInvocation:
     mcp_servers: dict[str, Any]
     model: str
     effort: str | None = "max"
-    permission_mode: str = "bypassPermissions"
     cwd: str | None = None
     setting_sources: list[str] | None = None
+    soft_ceiling_pct: float = 50.0
+    hard_ceiling_pct: float = 65.0
 
 
 @dataclass
@@ -61,38 +92,49 @@ class StageRunResult:
     stage_name: str
     exit_reason: str  # "stop" | "ceiling_hit" | "error"
     final_text: str
-    total_input_tokens: int
-    total_output_tokens: int
     peak_context_pct: float
+    total_output_tokens: int
     error: str | None = None
 
 
 # ---------------------------------------------------------------------------
-# 50%-ceiling helpers
+# Ceiling state shared between hooks and the run loop
 # ---------------------------------------------------------------------------
 
 
-# Context-window sizes by model (input tokens). Used to compute the 50% gate.
-# Conservative defaults; can be overridden via PHD_CONTEXT_WINDOW_<model> env var.
-_DEFAULT_WINDOWS = {
-    "claude-opus-4-7": 200_000,
-    "claude-sonnet-4-6": 200_000,
-    "claude-haiku-4-5-20251001": 200_000,
-}
+@dataclass
+class _CeilingState:
+    """Mutable state shared by the Pre/PostToolUse hooks for one stage run."""
+
+    inv: StageInvocation
+    client: ClaudeSDKClient | None = None
+    peak_pct: float = 0.0
+    soft_nudged: bool = False
+    hard_blocked: bool = False
+    allow_set: frozenset[str] = field(default_factory=frozenset)
+
+    async def current_pct(self) -> float | None:
+        """Authoritative context occupancy via the SDK. Defensive: never raise
+        into a hook (that would abort the turn)."""
+        if self.client is None:
+            return None
+        try:
+            cu = await asyncio.wait_for(self.client.get_context_usage(), timeout=15)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("get_context_usage failed in hook: %s", exc)
+            return None
+        pct = float(cu.get("percentage", 0.0) or 0.0)
+        self.peak_pct = max(self.peak_pct, pct)
+        return pct
 
 
-def context_window_for(model: str) -> int:
-    env = os.environ.get(f"PHD_CONTEXT_WINDOW_{model.upper().replace('-', '_')}")
-    if env:
-        return int(env)
-    return _DEFAULT_WINDOWS.get(model, 200_000)
-
-
-def usage_pct(used_input_tokens: int, model: str) -> float:
-    window = context_window_for(model)
-    if window <= 0:
-        return 0.0
-    return (used_input_tokens / window) * 100.0
+def _is_transcript_read(tool_name: str, tool_input: dict) -> bool:
+    """Block a downstream stage from slurping an upstream stage's raw transcript
+    (or any other run's artifacts) — that's the dilution vector we guard against."""
+    if tool_name not in ("Read", "Grep", "Glob"):
+        return False
+    target = str(tool_input.get("file_path") or tool_input.get("path") or tool_input.get("pattern") or "")
+    return "transcript.jsonl" in target
 
 
 # ---------------------------------------------------------------------------
@@ -100,89 +142,103 @@ def usage_pct(used_input_tokens: int, model: str) -> float:
 # ---------------------------------------------------------------------------
 
 
-async def run_stage(inv: StageInvocation, *, ceiling_pct: float = 50.0) -> StageRunResult:
-    """Open a fresh ClaudeSDKClient for one stage. Stream messages, persist them,
-    track token usage, inject a stop-and-checkpoint instruction on ceiling.
+async def run_stage(inv: StageInvocation) -> StageRunResult:
+    """Open a fresh ClaudeSDKClient for one stage with proactive ceiling hooks."""
+    state = _CeilingState(inv=inv, allow_set=frozenset(inv.allowed_tools))
 
-    The 50% ceiling is informational here: this function will signal `exit_reason
-    == "ceiling_hit"` so the orchestrator can decide whether to respawn the
-    stage with a checkpoint loaded in. Per-stage code is responsible for asking
-    the model to write the checkpoint when nudged.
-    """
+    async def can_use_tool(
+        tool_name: str, tool_input: dict, ctx: ToolPermissionContext
+    ) -> PermissionResultAllow | PermissionResultDeny:
+        # Firewall 1: enforce the stage allowlist ourselves (works under root,
+        # where bypassPermissions is forbidden, and is stricter than allowed_tools).
+        base = tool_name.split("__")[0] if not tool_name.startswith("mcp__") else tool_name
+        if tool_name not in state.allow_set and base not in state.allow_set:
+            return PermissionResultDeny(message=f"tool {tool_name} not in stage allowlist")
+        # Firewall 2: never let a stage read another stage's raw transcript.
+        if _is_transcript_read(tool_name, tool_input):
+            return PermissionResultDeny(
+                message="reading transcript.jsonl is forbidden — use the validated artifact"
+            )
+        return PermissionResultAllow()
+
+    async def pre_tool_hook(inp: dict, tool_use_id: str | None, ctx: HookContext) -> dict:
+        tool_name = inp.get("tool_name", "")
+        if tool_name in CONTEXT_GROWING_TOOLS:
+            pct = await state.current_pct()
+            if pct is not None and pct >= inv.hard_ceiling_pct:
+                state.hard_blocked = True
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": (
+                            f"HARD CONTEXT CEILING reached ({pct:.0f}% >= "
+                            f"{inv.hard_ceiling_pct:.0f}%). Do NOT gather more data. "
+                            "Immediately write your final artifact (or checkpoint.json "
+                            "if incomplete) using Write, then end your turn."
+                        ),
+                    }
+                }
+        return {}
+
+    async def post_tool_hook(inp: dict, tool_use_id: str | None, ctx: HookContext) -> dict:
+        pct = await state.current_pct()
+        if pct is not None and pct >= inv.soft_ceiling_pct and not state.soft_nudged:
+            state.soft_nudged = True
+            log.warning("stage %s: soft ceiling %.0f%% reached at %.0f%%",
+                        inv.stage_name, inv.soft_ceiling_pct, pct)
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": (
+                        f"[CONTEXT BUDGET WARNING] You are at {pct:.0f}% of the context "
+                        f"window (soft ceiling {inv.soft_ceiling_pct:.0f}%). Wrap up now: "
+                        "stop gathering new information and write your final artifact. If "
+                        "you cannot finish, write a concise checkpoint.json describing "
+                        "what's done, what remains, and the next concrete steps, then stop."
+                    ),
+                }
+            }
+        return {}
 
     options = ClaudeAgentOptions(
         allowed_tools=inv.allowed_tools,
         mcp_servers=inv.mcp_servers,
         system_prompt=inv.system_prompt,
-        permission_mode=inv.permission_mode,
+        permission_mode="default",  # bypassPermissions is forbidden under root
+        can_use_tool=can_use_tool,
         setting_sources=inv.setting_sources or ["user"],
         cwd=inv.cwd,
         model=inv.model,
         effort=inv.effort,
-        include_partial_messages=False,
+        hooks={
+            "PreToolUse": [HookMatcher(matcher=None, hooks=[pre_tool_hook])],
+            "PostToolUse": [HookMatcher(matcher=None, hooks=[post_tool_hook])],
+        },
     )
 
-    total_in = 0
     total_out = 0
-    peak_pct = 0.0
     final_text = ""
-    ceiling_hit = False
-    nudged_for_checkpoint = False
 
     try:
         async with ClaudeSDKClient(options=options) as client:
+            state.client = client
             await client.query(inv.user_prompt)
 
-            async for msg in client.receive_messages():
-                # Persist every message for later debugging.
+            async for msg in client.receive_response():
                 _persist(inv.run_id, inv.stage_name, msg)
-
-                # Track usage on assistant turns.
                 if isinstance(msg, AssistantMessage):
                     captured = _capture_text(msg)
                     if captured:
                         final_text = captured
-
                 if isinstance(msg, ResultMessage):
-                    usage = msg.usage or {}
-                    in_tok = int(usage.get("input_tokens", 0) or 0)
-                    in_tok += int(usage.get("cache_read_input_tokens", 0) or 0)
-                    out_tok = int(usage.get("output_tokens", 0) or 0)
-                    total_in = max(total_in, in_tok)
-                    total_out += out_tok
-                    pct = usage_pct(in_tok, inv.model)
-                    peak_pct = max(peak_pct, pct)
+                    total_out += int((msg.usage or {}).get("output_tokens", 0) or 0)
+                    break
 
-                    if pct >= ceiling_pct and not nudged_for_checkpoint:
-                        nudged_for_checkpoint = True
-                        ceiling_hit = True
-                        log.warning(
-                            "stage %s: context at %.1f%% (>=%.0f%% ceiling) — "
-                            "nudging for checkpoint",
-                            inv.stage_name,
-                            pct,
-                            ceiling_pct,
-                        )
-                        await client.query(
-                            "STOP. Context budget is approaching the 50% ceiling. "
-                            "Write a checkpoint file at "
-                            f"runs/{inv.run_id}/{_stage_dirname(inv.stage_name)}/"
-                            "checkpoint.json capturing: (a) what you have already "
-                            "completed, (b) what remains, (c) the next concrete "
-                            "actions. Then end your turn without doing more work."
-                        )
-                        continue
-
-                    # Any ResultMessage means the turn loop is finished — exit
-                    # regardless of subtype so we never spin on unknown values.
-                    return StageRunResult(
-                        stage_name=inv.stage_name,
-                        exit_reason="ceiling_hit" if ceiling_hit else "stop",
-                        final_text=final_text,
-                        total_input_tokens=total_in,
-                        total_output_tokens=total_out,
-                        peak_context_pct=peak_pct,
-                    )
+            # Authoritative final reading (between-turns call is always safe).
+            final_pct = await state.current_pct()
+            if final_pct is not None:
+                state.peak_pct = max(state.peak_pct, final_pct)
 
     except Exception as exc:  # noqa: BLE001 — surface any SDK error to the orchestrator
         log.exception("stage %s failed", inv.stage_name)
@@ -190,19 +246,18 @@ async def run_stage(inv: StageInvocation, *, ceiling_pct: float = 50.0) -> Stage
             stage_name=inv.stage_name,
             exit_reason="error",
             final_text=final_text,
-            total_input_tokens=total_in,
+            peak_context_pct=state.peak_pct,
             total_output_tokens=total_out,
-            peak_context_pct=peak_pct,
             error=str(exc),
         )
 
+    ceiling_hit = state.soft_nudged or state.hard_blocked
     return StageRunResult(
         stage_name=inv.stage_name,
         exit_reason="ceiling_hit" if ceiling_hit else "stop",
         final_text=final_text,
-        total_input_tokens=total_in,
+        peak_context_pct=state.peak_pct,
         total_output_tokens=total_out,
-        peak_context_pct=peak_pct,
     )
 
 
@@ -211,20 +266,9 @@ async def run_stage(inv: StageInvocation, *, ceiling_pct: float = 50.0) -> Stage
 # ---------------------------------------------------------------------------
 
 
-def _stage_dirname(stage_name: str) -> str:
-    from .persistence import STAGE_DIRS
-
-    return STAGE_DIRS[stage_name]
-
-
 def _capture_text(msg: AssistantMessage) -> str:
-    """Concatenate TextBlocks from an assistant message. ThinkingBlocks are
-    deliberately discarded — they're large and the orchestrator never needs them."""
-    out: list[str] = []
-    for block in msg.content:
-        if isinstance(block, TextBlock):
-            out.append(block.text)
-    return "\n".join(out).strip()
+    """Concatenate TextBlocks. ThinkingBlocks are deliberately discarded."""
+    return "\n".join(b.text for b in msg.content if isinstance(b, TextBlock)).strip()
 
 
 def _persist(run_id: str, stage_name: str, msg: Message) -> None:
@@ -234,12 +278,8 @@ def _persist(run_id: str, stage_name: str, msg: Message) -> None:
 
 
 def _message_to_event(msg: Message) -> dict | None:
-    """Compact one Message into a JSON-serializable transcript event."""
     if isinstance(msg, AssistantMessage):
-        return {
-            "type": "assistant",
-            "blocks": [_block_summary(b) for b in msg.content],
-        }
+        return {"type": "assistant", "blocks": [_block_summary(b) for b in msg.content]}
     if isinstance(msg, UserMessage):
         return {"type": "user", "content_kind": type(msg.content).__name__}
     if isinstance(msg, SystemMessage):

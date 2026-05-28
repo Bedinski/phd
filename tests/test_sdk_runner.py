@@ -1,97 +1,57 @@
-"""Unit tests for `sdk_runner.run_stage` with the SDK mocked.
+"""Tests for `sdk_runner`: the tool firewall + the run loop with a faked client.
 
-We don't actually call Claude here — we patch `ClaudeSDKClient` to yield a
-canned message sequence and assert the runner records usage, persists the
-transcript, and signals exit reason correctly.
+We don't call Claude. We fake ClaudeSDKClient with a canned ResultMessage and a
+get_context_usage() return so we can assert the runner records the real peak
+percentage and exit reason, and we test the transcript-read firewall directly.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any
+from claude_agent_sdk import ResultMessage
 
-import pytest
-
-from phd.persistence import ensure_run_layout, mint_run_id, stage_dir
-from phd.sdk_runner import StageInvocation, run_stage, usage_pct
-
-
-def test_usage_pct() -> None:
-    assert usage_pct(0, "claude-opus-4-7") == 0.0
-    assert usage_pct(100_000, "claude-opus-4-7") == pytest.approx(50.0)
-    assert usage_pct(200_000, "claude-opus-4-7") == pytest.approx(100.0)
+from phd.persistence import ensure_run_layout, mint_run_id
+from phd.sdk_runner import (
+    CONTEXT_GROWING_TOOLS,
+    StageInvocation,
+    _is_transcript_read,
+    run_stage,
+)
 
 
-@dataclass
-class _FakeAssistant:
-    content: list
-    usage: dict[str, Any] | None = None
-    model: str = "claude-opus-4-7"
+def test_transcript_read_is_blocked() -> None:
+    assert _is_transcript_read("Read", {"file_path": "runs/x/01_research/transcript.jsonl"})
+    assert _is_transcript_read("Grep", {"pattern": "runs/x/02_review/transcript.jsonl"})
+    # Reading the actual artifact is fine.
+    assert not _is_transcript_read("Read", {"file_path": "runs/x/01_research/findings.json"})
+    # Non-read tools are unaffected.
+    assert not _is_transcript_read("Write", {"file_path": "x/transcript.jsonl"})
 
 
-@dataclass
-class _FakeResult:
-    subtype: str
-    usage: dict[str, Any]
-    is_error: bool = False
-    num_turns: int = 1
-    duration_ms: int = 100
+def test_context_growing_tools_include_web_and_mcp() -> None:
+    assert "WebFetch" in CONTEXT_GROWING_TOOLS
+    assert "WebSearch" in CONTEXT_GROWING_TOOLS
+    assert "mcp__phd__run_backtest" in CONTEXT_GROWING_TOOLS
+    # Write must never be gated — the model needs it to persist a checkpoint.
+    assert "Write" not in CONTEXT_GROWING_TOOLS
 
 
-class _CannedClient:
-    """Async-context-manager stub that mimics ClaudeSDKClient just enough."""
-
-    def __init__(self, options):  # noqa: ARG002
-        self.options = options
-        self._queries: list[str] = []
-        self._scripts: list[list[Any]] = [
-            [
-                # First turn: a result message at well-under-50% usage.
-                _FakeResult(
-                    subtype="success",
-                    usage={"input_tokens": 5_000, "output_tokens": 200},
-                )
-            ],
-        ]
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc) -> bool:
-        return False
-
-    async def query(self, prompt: str) -> None:
-        self._queries.append(prompt)
-
-    async def receive_messages(self):
-        for batch in self._scripts:
-            for msg in batch:
-                yield msg
-
-
-async def test_run_stage_records_usage_and_returns_stop(monkeypatch, tmp_path) -> None:
-    from claude_agent_sdk import (
-        AssistantMessage as _A,
-        ResultMessage as _R,
-    )
-
-    # Make our fake messages instance-check as the real classes.
-    fake_assistant = type("FA", (_A,), {})
-    fake_result = type("FR", (_R,), {})
-
-    # Build a runtime instance of the real ResultMessage so the isinstance check
-    # in run_stage matches. The real ResultMessage is a regular dataclass.
-    real_result = _R(
+def _make_result(pct_first: int) -> ResultMessage:
+    return ResultMessage(
         subtype="success",
-        duration_ms=100,
-        duration_api_ms=80,
+        duration_ms=10,
+        duration_api_ms=8,
         is_error=False,
         num_turns=1,
         session_id="s",
-        usage={"input_tokens": 5_000, "output_tokens": 200},
+        usage={"input_tokens": 1000, "output_tokens": 50},
     )
 
-    class _Client:
+
+async def test_run_stage_records_peak_pct_and_stop(monkeypatch, tmp_path) -> None:
+    """A clean turn under the ceiling returns exit_reason='stop' and the real
+    peak percentage from get_context_usage()."""
+
+    class _FakeClient:
         def __init__(self, options):
             self.options = options
 
@@ -104,27 +64,55 @@ async def test_run_stage_records_usage_and_returns_stop(monkeypatch, tmp_path) -
         async def query(self, prompt):
             pass
 
-        async def receive_messages(self):
-            yield real_result
+        async def receive_response(self):
+            yield _make_result(20)
 
-    monkeypatch.setattr("phd.sdk_runner.ClaudeSDKClient", _Client)
+        async def get_context_usage(self):
+            return {"percentage": 20, "totalTokens": 40000, "maxTokens": 200000}
+
+    monkeypatch.setattr("phd.sdk_runner.ClaudeSDKClient", _FakeClient)
+    monkeypatch.setattr("phd.persistence.RUNS_ROOT", tmp_path)
 
     rid = mint_run_id()
     ensure_run_layout(rid, root=tmp_path)
-    # Point persistence at the tmp_path
-    monkeypatch.setattr("phd.persistence.RUNS_ROOT", tmp_path)
 
     inv = StageInvocation(
         run_id=rid,
         stage_name="research",
         system_prompt="sys",
-        user_prompt="hi",
-        allowed_tools=["Read"],
+        user_prompt="go",
+        allowed_tools=["Read", "Write"],
         mcp_servers={},
         model="claude-opus-4-7",
+        soft_ceiling_pct=50.0,
+        hard_ceiling_pct=65.0,
     )
-
-    result = await run_stage(inv, ceiling_pct=50.0)
+    result = await run_stage(inv)
     assert result.exit_reason == "stop"
-    assert result.total_input_tokens == 5_000
-    assert result.peak_context_pct < 50.0
+    assert result.peak_context_pct == 20.0
+    assert result.total_output_tokens == 50
+
+
+async def test_run_stage_surfaces_errors(monkeypatch, tmp_path) -> None:
+    class _BoomClient:
+        def __init__(self, options):
+            pass
+
+        async def __aenter__(self):
+            raise RuntimeError("connect failed")
+
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch.setattr("phd.sdk_runner.ClaudeSDKClient", _BoomClient)
+    monkeypatch.setattr("phd.persistence.RUNS_ROOT", tmp_path)
+
+    rid = mint_run_id()
+    ensure_run_layout(rid, root=tmp_path)
+    inv = StageInvocation(
+        run_id=rid, stage_name="research", system_prompt="s", user_prompt="g",
+        allowed_tools=["Read"], mcp_servers={}, model="claude-opus-4-7",
+    )
+    result = await run_stage(inv)
+    assert result.exit_reason == "error"
+    assert "connect failed" in (result.error or "")

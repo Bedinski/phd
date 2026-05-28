@@ -36,7 +36,6 @@ def compute_intended_orders(spec: StrategySpec, *, as_of: date | None = None) ->
     and exit rules on the most recent bars and decide what action (if any)
     today would take.
     """
-    import pandas as pd
 
     as_of = as_of or date.today()
     start = date(as_of.year - 1, as_of.month, as_of.day)  # 1y of history is enough for indicators

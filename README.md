@@ -12,11 +12,19 @@ Single-agent research pipelines drift, dilute findings, and exhaust context
 windows on long runs. This pipeline solves all three:
 
 1. **Context ≤ 50% per stage** — each stage runs in its own
-   `ClaudeSDKClient` session (fresh 0% context) with a per-turn usage hook
-   that checkpoints and respawns the session before crossing the ceiling.
+   `ClaudeSDKClient` session (fresh 0% context). A `PostToolUse` hook reads the
+   SDK's real `get_context_usage()` after every tool call and, at the soft
+   ceiling (50%), injects a directive to wrap up; a `PreToolUse` hook denies
+   further context-growing tools at the hard ceiling (65%), forcing the agent
+   to checkpoint. The orchestrator then respawns the stage with only that
+   checkpoint loaded. Enforcement is *proactive and mid-turn*, not a post-hoc
+   token estimate.
 2. **Persistence + clean handoffs** — every stage writes a pydantic-validated
-   JSON artifact under `runs/<run_id>/`; the next stage reads only that
-   artifact, never the prior transcript.
+   JSON artifact under `runs/<run_id>/`. The next stage receives those
+   artifacts *injected inline* into its prompt (deterministic — no "please read
+   the file"), and a tool firewall blocks any stage from reading another
+   stage's raw `transcript.jsonl`. Handoffs are integrity-checked (run-id match,
+   and the backtest result's spec-hash must match the frozen spec).
 3. **No skew / dilution** — citation-bound research claims, an independent
    review stage that re-fetches each cited URL, a frozen strategy spec, and
    per-stage tool allowlists keep findings honest as they move downstream.
@@ -50,6 +58,10 @@ cp .env.example .env                 # add Alpaca paper credentials
 The Agent SDK inherits your local Claude Code auth, so no `ANTHROPIC_API_KEY`
 is needed if you're already signed into Claude Code.
 
+Stages run with `permission_mode="default"` plus a `can_use_tool` callback that
+enforces each stage's tool allowlist. (We avoid `bypassPermissions` because the
+CLI refuses it when running as root, e.g. in containers/CI.)
+
 ## Usage
 
 ```bash
@@ -58,6 +70,10 @@ phd research --universe sp500 --strategy-type "post-earnings drift mean reversio
 
 # Smaller live smoke test
 phd research --universe sp500_top10 --strategy-type "SMA crossover" --cheap
+
+# Resume a stalled run (reuses valid artifacts; re-runs what's missing)
+phd resume <run_id>
+phd resume <run_id> --from-stage backtest   # force re-run from a stage onward
 
 # Inspect a finished run
 phd inspect <run_id>
