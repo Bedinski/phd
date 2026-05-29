@@ -221,6 +221,7 @@ async def _run_one(
             soft_ceiling_pct=inp.soft_ceiling_pct,
             hard_ceiling_pct=inp.hard_ceiling_pct,
             required_artifacts=required,
+            skills=stage.skills,
         )
         result = await run_stage(inv)
         if result.exit_reason == "error":

@@ -37,6 +37,7 @@ class StageDef:
     output_filename: str | tuple[str, ...]
     output_model_cls: type | tuple[type, ...]
     uses_phd_mcp: bool = False
+    skills: tuple[str, ...] = ()
 
 
 def _load(prompt_filename: str) -> str:
@@ -47,9 +48,16 @@ STAGES: dict[str, StageDef] = {
     "research": StageDef(
         name="research",
         prompt_template=_load("research.md"),
-        allowed_tools=("WebSearch", "WebFetch", "Read", "Write"),
+        # Task / TodoWrite / Glob / Grep are allowed because /deep-research
+        # fans out subagents and uses todo-tracking + light file lookups.
+        # Bash is deliberately still excluded.
+        allowed_tools=(
+            "WebSearch", "WebFetch", "Read", "Write",
+            "Task", "TodoWrite", "Glob", "Grep",
+        ),
         output_filename="findings.json",
         output_model_cls=ResearchFindings,
+        skills=("deep-research",),
     ),
     "review": StageDef(
         name="review",

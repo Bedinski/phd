@@ -87,6 +87,8 @@ class StageInvocation:
     # Required artifacts whose existence on disk is the stage's success condition.
     # The Stop hook will refuse to let the turn end until they exist.
     required_artifacts: tuple[Path, ...] = ()
+    # Claude Code skills the stage may invoke (e.g. /deep-research).
+    skills: tuple[str, ...] = ()
 
 
 @dataclass
@@ -244,6 +246,7 @@ async def run_stage(inv: StageInvocation) -> StageRunResult:
         cwd=inv.cwd,
         model=inv.model,
         effort=inv.effort,
+        skills=list(inv.skills) if inv.skills else None,
         hooks={
             "PreToolUse": [HookMatcher(matcher=None, hooks=[pre_tool_hook])],
             "PostToolUse": [HookMatcher(matcher=None, hooks=[post_tool_hook])],

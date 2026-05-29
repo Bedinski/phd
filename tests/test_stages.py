@@ -27,6 +27,22 @@ def test_each_stage_has_disjoint_or_intentional_tools() -> None:
     assert "mcp__phd__monte_carlo" in risk_tools
 
 
+def test_research_stage_uses_deep_research_skill() -> None:
+    # Stage 1 delegates to Anthropic's /deep-research skill; Task is allowed
+    # so the skill can fan out subagents. Bash stays denied for safety.
+    research = STAGES["research"]
+    assert research.skills == ("deep-research",)
+    assert "Task" in research.allowed_tools
+    assert "Bash" not in research.allowed_tools
+
+
+def test_only_research_uses_skills_by_default() -> None:
+    for name, stage in STAGES.items():
+        if name == "research":
+            continue
+        assert stage.skills == (), f"stage {name} unexpectedly has skills {stage.skills}"
+
+
 def test_all_prompts_render() -> None:
     ctx = {
         "run_id": "r-1",

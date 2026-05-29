@@ -37,7 +37,7 @@ windows on long runs. This pipeline solves all three:
 
 | Stage | Tools | In | Out |
 |-------|-------|----|----|
-| Research | WebSearch · WebFetch · Read · Write | thesis + universe | `findings.json` |
+| Research | `/deep-research` skill (Opus 4.8) · WebSearch · WebFetch · Read · Write · Task | thesis + universe | `findings.json` |
 | Review | WebFetch · Read · Write | `findings.json` | `critique.json` + `decision.json` |
 | Strategy Synthesis | Read · Write | findings | `strategy_spec.json` (frozen) |
 | Backtest | phd-mcp tools | spec | `backtest_result.json` |
